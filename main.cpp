@@ -1,18 +1,41 @@
 #include <avr/io.h>
 #include <util/delay.h>
+#include <avr/interrupt.h>
 
 #define BLINK_DELAY	( 250 )
 #define RAPID_DELAY	( 25 )
-#define PWM_DELAY	( 5000 - BLINK_DELAY )
-#define PWM_TOP		( 20 )
+#define PWM_DELAY	( 1000 - BLINK_DELAY )
+#define PWM_TOP		( 79 )
+
+#define DUTY_CYCLE( P )	( unsigned char )( ( ( P / 100.0f ) * PWM_TOP ) - 1 )
+
+volatile unsigned long g_tachCount = 0;
 
 /**
  * Configure pins for input, output, pull-ups etc.
  */
 void configurePins( void )
 {
+	// Configure all pins as inputs
+	DDRB = 0;
+	DDRC = 0;
+	DDRD = 0;
+
+	// Configure all pins without pull-ups
+	PORTB = 0;
+	PORTC = 0;
+	PORTD = 0;
+
 	DDRB |= _BV( DDB5 );	// PB5 (Arduino Uno Pin 13) => OUTPUT (LED)
-	DDRD |= _BV( DDB3 );	// PD3 (Arduino Uno Pin 3) => OUTPUT (PWM)
+	DDRD |= _BV( DDD3 );	// PD3 (Arduino Uno Pin 3)  => OUTPUT (PWM)
+
+	PORTB |= _BV( DDD2 );   // PB2 (Arduino Uni Pin 2 ) => Pull-up Resistor
+
+	// Set up INT0 to trigger on rising edge
+	EICRA |= _BV( ISC00 ) | _BV( ISC01 );
+	EIMSK |= _BV( INT0 );
+
+	sei();
 }
 
 /**
@@ -41,6 +64,11 @@ void blinkLed( unsigned int length )
 	PORTB &= ~_BV( PORTB5 );	// PB5 => LOW (LED OFF)
 }
 
+void toggleLed(void)
+{
+	PORTB ^= _BV( PORTB5 );
+}
+
 /**
  * Rapid blink the LED on PB5.
  */
@@ -61,7 +89,7 @@ void multiBlink( const unsigned char count, unsigned int onLength, unsigned int 
 /*
  * Start the PWM signal on PB3 at the defined duty cycle.
  */
-int startPWM( const unsigned char dutyCycleAsPercentage )
+int startPWM( const float dutyCycleAsPercentage )
 {
 	unsigned char dutyCycle = 0;
 
@@ -70,21 +98,17 @@ int startPWM( const unsigned char dutyCycleAsPercentage )
 
 	// Set up the registers
 	//
-	// Phase-correct PWM
- 	// Non-Inverted
-	// Prescaler: 8
-	// Clock: 16Mhz
+	// Fast PWM w/ TOP (WGM20 | WGM21 | WGM22)
+ 	// Non-Inverted    (COM2A1 | COM2B1)
+	// Prescaler of 8  (CS21)
+	// Clock: 16MHz
 	//
-	// Output A frequency: 16MHz / 8 / 20 / 2 / 2 = 12.5kHz
-	// Output A duty cycle: 50%
-	// Output B frequency: 16MHz / 8 / 20 / 2 = 25kHz
-	// Output B duty cycle: OCR2B / 20 = dutyCycleAsPercentage%
-	//
-	// OCR2B = ( dutyCycleAsPercentage / 100 ) * 20
-	dutyCycle = ( unsigned char )( ( ( float ) dutyCycleAsPercentage / 100.0f ) * PWM_TOP );
+	// Output B frequency: 16MHz / 8 / ( 79 + 1 ) = 25KHz
+	// OCR2B = ( ( dutyCycleAsPercentage / 100 ) * PWM_TOP ) - 1
+	dutyCycle = DUTY_CYCLE(  dutyCycleAsPercentage );
 
-	TCCR2A = _BV( COM2A0 ) | _BV( COM2B1 ) | _BV( WGM20 );
-	TCCR2B = _BV( WGM22 ) | _BV( CS21 );
+	TCCR2A = _BV( COM2A1 ) | _BV( COM2B1 ) | _BV( WGM21 ) | _BV( WGM20 );
+	TCCR2B = _BV( CS21 ) | _BV( WGM22 );
 	OCR2A = PWM_TOP;
 	OCR2B = dutyCycle;
 
@@ -94,15 +118,15 @@ int startPWM( const unsigned char dutyCycleAsPercentage )
 /**
  * Set the PWM duty cycle.
  */
-int setPWMDutyCycle( const unsigned char dutyCycleAsPercentage )
+int setPWMDutyCycle( const float dutyCycleAsPercentage )
 {
 	unsigned char dutyCycle = 0;
 
 	// Validate the dutyCycle (0-100)
 	if( dutyCycleAsPercentage > 100) return -1;
 
-	// OCR2B = ( dutyCycleAsPercentage / 100 ) * 20
-	dutyCycle = ( unsigned char )( ( ( float ) dutyCycleAsPercentage / 100.0f ) * PWM_TOP );
+	// OCR2B = ( ( dutyCycleAsPercentage / 100 ) * PWM_TOP ) - 1
+	dutyCycle = DUTY_CYCLE(  dutyCycleAsPercentage );
 
 	OCR2B = dutyCycle;
 
@@ -117,19 +141,22 @@ void benchmarkPWMFan( const unsigned char min, const unsigned char max, const un
 	setPWMDutyCycle( 0 );
 
 	// Give the fan a chance to actually stop
-	variableDelay( PWM_DELAY );
+	variableDelay( 10 * PWM_DELAY );
 
 	for( unsigned char dutyCycle = min; dutyCycle <= max; dutyCycle += increment )
 	{
 		setPWMDutyCycle( dutyCycle );
-		blinkLed( BLINK_DELAY );
+		//blinkLed( BLINK_DELAY );
 		variableDelay( PWM_DELAY );
 	}
+
+	// Hang at the top for a bit
+	variableDelay( 10 * PWM_DELAY );
 
 	for( unsigned char dutyCycle = max - increment; dutyCycle >= min; dutyCycle -= increment )
 	{
 		setPWMDutyCycle( dutyCycle );
-		blinkLed( BLINK_DELAY );
+		//blinkLed( BLINK_DELAY );
 		variableDelay( PWM_DELAY );
 	}
 
@@ -147,11 +174,17 @@ int main( void )
 	{
 		while( true )
 		{
-			multiBlink( 10, 10 * RAPID_DELAY, 10 * RAPID_DELAY );
-			benchmarkPWMFan( 20, 100, 20 );
-			multiBlink( 100, RAPID_DELAY, RAPID_DELAY );
+			//multiBlink( 10, 10 * RAPID_DELAY, 10 * RAPID_DELAY );
+			benchmarkPWMFan( 10, 100, 2 );
+			//multiBlink( 100, RAPID_DELAY, RAPID_DELAY );
 		}
 	}
 
 	return 0;
+}
+
+ISR(INT0_vect)
+{
+	g_tachCount++;
+	toggleLed();
 }
